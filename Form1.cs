@@ -17,6 +17,7 @@ namespace TableSchemaExport
 
         int _currentExcelRow = 1;
         public string ConnectionString = string.Empty;
+        private List<SqlObjectModel> sqlObjectList = new List<SqlObjectModel>();
 
         #endregion
 
@@ -47,15 +48,27 @@ namespace TableSchemaExport
                 {
                     conn.Open();
                     ConnectionString = this.Input_Connection.Text;
-                    cmd.CommandText = "select name from sysobjects where xtype='U' order by name";
+                    cmd.CommandText = @"Select b.name+'.'+a.name as name, b.name as schemaName, a.type
+                                                                    From sys.objects a
+                                                                    Inner Join sys.schemas b on a.schema_id = b.schema_id
+                                                                    Where (a.type='U' or a.type='V') and a.name<>'__RefactorLog'
+                                                                    order by b.name, a.type, a.name";
 
                     this.Input_CheckBoxList.Items.Clear();
+                    this.sqlObjectList.Clear();
 
                     using (SqlDataReader dr = cmd.ExecuteReader())
                     {
                         while (dr.Read())
                         {
-                            this.Input_CheckBoxList.Items.Add(dr["name"].ToString());
+                            var index = this.Input_CheckBoxList.Items.Add(dr["name"].ToString());
+                            var type = dr["type"].ToString().Trim() == "U" ? "table" : "view";
+                            this.sqlObjectList.Add(new SqlObjectModel
+                            {
+                                Name = dr["name"].ToString(),
+                                Schema = dr["schemaName"].ToString(),
+                                Type = type
+                            });
                         }
                     }
 
@@ -91,18 +104,22 @@ namespace TableSchemaExport
                     {
                         for (int i = 0; i < tables.Count; i++)
                         {
-                            string tableDescription = string.IsNullOrEmpty(this.Input_TableDescription.Text.Trim()) ? tables[i] : GetTableChinese(tables[i]);
+                            var tableName = tables[i];
+                            var obj = this.sqlObjectList.Find(x => x.Name == tableName);
+                            string tableDescription = string.IsNullOrEmpty(this.Input_TableDescription.Text.Trim()) ? tableName : GetTableChinese(tableName, obj);
 
                             ep.Workbook.Worksheets.Add(tables[i]); // 新增試算表  
                             ExcelWorksheet sheet = ep.Workbook.Worksheets[i + 1];  //取得剛剛加入的Sheet
 
-                            DataTable dt = GetSchema(tables[i]);
+                            DataTable dt = GetSchema(tableName, obj);
                             DataColumnCollection fields = dt.Columns;
 
                             _currentExcelRow = 1;
-                            sheet.Cells[_currentExcelRow, 1].Value = "資料表說明 : " + (string.Compare(tableDescription, tables[i]) == 0 ? "" : tableDescription);
+                            sheet.Cells[_currentExcelRow, 1].Value = "類型 : " + obj.Type;
                             _currentExcelRow++;
-                            sheet.Cells[_currentExcelRow, 1].Value = "資料表名稱 : " + tables[i];
+                            sheet.Cells[_currentExcelRow, 1].Value = "說明 : " + (string.Compare(tableDescription, tables[i]) == 0 ? "" : tableDescription);
+                            _currentExcelRow++;
+                            sheet.Cells[_currentExcelRow, 1].Value = "名稱 : " + tables[i];
                             _currentExcelRow++;
                             _currentExcelRow++;
 
@@ -156,8 +173,9 @@ namespace TableSchemaExport
                         {
                             ep.SaveAs(fs);
                             MessageBox.Show("檔案已產生到【" + excelName + "】");
-                            System.Diagnostics.Process.Start(excelName);
                         }
+
+                        System.Diagnostics.Process.Start(excelName);
                     }
                 }
                 else
@@ -175,11 +193,11 @@ namespace TableSchemaExport
 
         #region Methods
 
-        private DataTable GetSchema(string tableName)
+        private DataTable GetSchema(string tableName, SqlObjectModel obj)
         {
             DataTable dt = new DataTable();
 
-            string commText = @"SELECT
+            string commText = $@"SELECT
 	                                                    case when isnull(e.is_primary_key,0)=1 then 'V' else '' end as [主鍵],   --Primary Key 
 	                                                    case when fkc.parent_object_id is not null then 'V' else '' end as [外來鍵] ,  --[Foreign Key]
 	                                                    case when isnull(c.is_identity,0)=1 then 'V' else '' end as [自動遞增], 
@@ -189,7 +207,7 @@ namespace TableSchemaExport
 	                                                    isnull((
 		                                                    SELECT
 		                                                    value
-		                                                    FROM fn_listextendedproperty (NULL, 'schema', 'dbo', 'table', a.TABLE_NAME, 'column', default)
+		                                                    FROM fn_listextendedproperty (NULL, 'schema', '{ obj.Schema }', '{ obj.Type }', a.TABLE_NAME, 'column', default)
 		                                                    WHERE name='MS_Description'
 		                                                    and objtype='COLUMN'
 		                                                    and objname Collate Chinese_Taiwan_Stroke_CI_AS = b.COLUMN_NAME
@@ -211,7 +229,7 @@ namespace TableSchemaExport
                                                     LEFT JOIN sys.indexes e on e.object_id=d.object_id AND e.is_primary_key=1 AND e.index_id=d.index_id
                                                     LEFT JOIN sys.foreign_key_columns fkc ON fkc.parent_object_id = c.object_id AND fkc.parent_column_id = c.column_id 
                                                     LEFT JOIN sys.columns fk ON fk.object_id = fkc.referenced_object_id AND fk.column_id = fkc.referenced_column_id
-                                                    WHERE TABLE_TYPE='BASE TABLE' and a.TABLE_NAME='" + tableName + @"'
+                                                    WHERE  a.TABLE_NAME='{ tableName.Split('.')[1] }' -- and TABLE_TYPE='BASE TABLE'
                                                     order by a.TABLE_NAME,b.ORDINAL_POSITION ";
 
             using (SqlConnection conn = new SqlConnection(ConnectionString))
@@ -229,7 +247,7 @@ namespace TableSchemaExport
         /// </summary>
         /// <param name="tableName"></param>
         /// <returns></returns>
-        private string GetTableChinese(string tableName)
+        private string GetTableChinese(string tableName, SqlObjectModel obj)
         {
             string result = tableName;
 
@@ -237,7 +255,9 @@ namespace TableSchemaExport
             using (SqlCommand cmd = conn.CreateCommand())
             {
                 conn.Open();
-                cmd.CommandText = "SELECT value FROM ::fn_listextendedproperty(default, 'user', 'dbo', 'table', default, default, default) where name='TableDescription' and objname='" + tableName + "'";
+                cmd.CommandText = $@"SELECT value FROM ::fn_listextendedproperty(default, 'user', '{ obj.Schema }', '{ obj.Type }', default, default, default) 
+                                                                where name='{ this.Input_TableDescription.Text.Trim() }' 
+                                                                and objname='{ tableName.Split('.')[1] }'";
 
                 object value = cmd.ExecuteScalar();
 
